@@ -42,20 +42,27 @@ def _flush_pending_tty_input() -> None:
     """Drop unread keypresses typed while the model was generating output."""
     try:
         fd = sys.stdin.fileno()
+        # 如果不是终端环境（比如管道输入），直接返回。
         if not os.isatty(fd):
             return
     except Exception:
         return
 
     try:
+        # 优先使用 termios（最高效）
         import termios
+        #  使用 termios.tcflush 系统调用清空输入缓冲区，
+        #  这是最干净、最高效的方式。TCIFLUSH 标志表示清除接收到但未读取的数据
         termios.tcflush(fd, termios.TCIFLUSH)
         return
     except Exception:
         pass
 
     try:
+        # 降级到 select + read（兼容方案）
         while True:
+            # 如果 termios 不可用（比如某些平台），使用 select 检查是否有待读数据，
+            # 然后用 os.read 读取并丢弃，直到缓冲区为空。
             ready, _, _ = select.select([fd], [], [], 0)
             if not ready:
                 break
@@ -65,6 +72,19 @@ def _flush_pending_tty_input() -> None:
         return
 
 
+#   具体来说：
+#
+#   1. 保存的状态：在 _init_prompt_session() 函数中（第 93 行），程序会先用 termios.tcgetattr() 保存终端的原始属性到 _SAVED_TERM_ATTRS 变量中
+#   2. 恢复操作：_restore_terminal 函数会：
+#     - 检查是否有保存的终端状态（第 77-78 行）
+#     - 使用 termios.tcsetattr() 将终端恢复到保存的状态（第 81 行）
+#     - 使用 TCSADRAIN 标志，表示等待所有输出完成后再改变终端属性
+#   3. 为什么需要这个：
+#     - 交互式命令行程序（如使用 prompt_toolkit）会修改终端的行为（比如关闭回显、改变缓冲模式等）
+#     - 如果程序异常退出而不恢复终端状态，用户的终端可能会出现输入不显示、行为异常等问题
+#     - 这个函数确保程序退出时终端能正常工作
+#
+#   简单说，就是一个"善后"函数，防止程序把用户的终端搞乱了。
 def _restore_terminal() -> None:
     """Restore terminal to its original state (echo, line buffering, etc.)."""
     if _SAVED_TERM_ATTRS is None:
